@@ -1,0 +1,43 @@
+software =
+{
+	version = "0.1.0";
+	description = "this is backup image "
+	eamb9918 = {
+		hardware-compatibility: [ "1.0"];
+		
+		files: (
+			{
+				filename = "Image";
+				path = "/Image";
+				device = "/dev/mmcblk2p1";
+				filesystem = "vfat";
+			},
+			{
+				filename = "imx8mm-adv-eamb9918-a1.dtb";
+				path = "/imx8mm-adv-eamb9918-a1.dtb";
+				device = "/dev/mmcblk2p1";
+				filesystem = "vfat";
+			},
+                        {
+                                filename = "sha256sums";
+                                path = "/sha256sums";
+                                device = "/dev/mmcblk2p1";
+                                filesystem = "vfat";
+                        }
+		);
+		images: (
+			{
+				filename = "rootfs.zstd";
+				device = "/dev/mmcblk2p3";
+				type = "raw";
+				compressed = "zstd";
+			}
+		);
+		scripts: (
+			{
+				filename = "fixupdate.sh";
+				type = "shellscript";
+			}
+		);
+	}
+}
