@@ -1,0 +1,883 @@
+#!/bin/bash
+
+#check boot
+RECOVERY_CMD="recovery_command"
+RECOVERY_STATUS="recovery_status"
+if [ -d "/sys/firmware/efi" ];then
+	GRUB_WITH_INITRD="YES"
+    BOOT_FROM_EMMC=`cat /proc/cmdline | grep "root=/dev/mmcblk2p3"`
+fi
+if [ ! -z "${GRUB_WITH_INITRD}" ]; then
+	MOUNT_POINT=`mount | grep /dev/mmcblk2p1 |  awk -F ' ' '{print $3}'`
+    if  [ -z ${MOUNT_POINT} ];then 
+        BOOT_GRUB_PARTTION="/boot/efi"
+        [ ! -d ${MOUNT_POINT} ] && mkdir -p ${BOOT_GRUB_PARTTION}
+        mount -t auto "/dev/mmcblk2p1" ${BOOT_GRUB_PARTTION}
+        MOUNT_POINT=${BOOT_GRUB_PARTTION}
+    fi
+    
+    GRUB_ENV="${MOUNT_POINT}/grub/grubenv"
+    PRINT_ENV="cat $GRUB_ENV"
+    # uefi use grub-reboot cmd to modify next boot entry instead of RECOVERY_CMD
+	SET_BACKUP_ENV_COMMAND="grub-editenv ${MOUNT_POINT}/grub/grubenv set ${RECOVERY_CMD}="
+    SET_BACKUP_ENV_STATUS="grub-editenv ${MOUNT_POINT}/grub/grubenv set ${RECOVERY_STATUS}="
+    UNSET_UEFI_BACKUP_ENV_COMMAND="grub-editenv ${MOUNT_POINT}/grub/grubenv unset ${RECOVERY_CMD} "
+    UNSET_UEFI_BACKUP_ENV_STATUS="grub-editenv ${MOUNT_POINT}/grub/grubenv unset ${RECOVERY_STATUS} "
+else
+	PRINT_ENV="fw_printenv"    
+    SET_BACKUP_ENV_COMMAND="fw_setenv ${RECOVERY_CMD} "
+    SET_BACKUP_ENV_STATUS="fw_setenv ${RECOVERY_STATUS} "
+fi
+BOOT_INITRD=`${PRINT_ENV} | grep $RECOVERY_STATUS  | awk -F '=' '{print $2}'`
+BACKUP_CMD=`${PRINT_ENV} | grep $RECOVERY_CMD  | awk -F '=' '{print $2}'`
+BACKUP_STATUS_IN_PROCESS="in_process"
+BACKUP_TOOLS_FILE="atcc.sys-backup-tools"
+BACKUP_TOOLS="/usr/src/$BACKUP_TOOLS_FILE"
+ABS_DIR_USB="/run/media/sda1"
+EMMC_NODE="/dev/mmcblk2"
+EMMC_DIR_ROOTFS=`mount | grep ${EMMC_NODE}p3 |  awk -F ' ' '{print $3}' | awk 'NR==1'`
+EMMC_DIR_DEROOTFS="/run/media/mmcblk2p3"
+LOG_FILE=${ABS_DIR_USB}/atcc.sys-backup.log
+BACKUP_INIT_CNT=1
+BACKUP_INIT_DONE="/etc/.adv_init_done"
+INITRD_NAME="/initrd/initrd-cpio-iso.img"
+#the path store aes_key for encrypt data
+DEF_SIGN_FILE_PATH="/usr/src/device/backup_image"
+# certificate file in the appropriate directory  
+DEF_CERT_FILE_PATH="/usr/local/share/ca-certificates"
+# path  in the system's private key
+DEF_PRIV_FILE_PATH="/etc/ssl/private"
+# symbolic links to trusted certificates
+CERT_LINK_PATH="/etc/ssl/certs"
+DEF_PRIV_KEY="backup_priv.pem"
+DEF_CERT="backup_ca.crt"
+DEF_CERT_LINK="backup_ca.pem"
+DEF_AESKEY="aes_key"
+DEF_X509_CONFIG="x509_backup.genkey"
+
+
+red="\033[0;31m"
+yellow="\033[1;33m"
+reset_color="\033[0;00m"
+
+function echo_red() {
+    printf $red
+    echo "$1"
+    printf $reset_color
+}
+
+function echo_yellow() {
+    printf $yellow
+    echo  "$1"
+    printf $reset_color
+}
+
+function boot_device(){
+    boot_from_mmcblk1=`cat /proc/cmdline | grep "root=/dev/mmcblk1"`
+    #sd-card boot
+    if [ "$boot_from_mmcblk1" != "" ];then
+        echo_red "please boot from EMMC , then try "atcc.sys-backup"  again"
+        exit 1;
+    fi
+}
+
+function do_wait_key_event {
+	read -t 10 -p "OH!there is something wrong .Please press any key or wait ten seconds to reboot "	
+	/usr/bin/atcc.sys-backup-msg FAILURE_DONE
+	echo "Unexpected reboot"  >> $LOG_FILE
+}
+
+function do_clean {
+	if [ -d "${ABS_DIR_USB}"/"${BACKUP_TOOLS_FILE}" ]; then
+	    echo "[Backup delete backup tools]"   
+       	rm -rf ${ABS_DIR_USB}/${BACKUP_TOOLS_FILE}		 
+		rm -rf ${ABS_DIR_USB}/*.REC
+		 
+    else
+        echo "[no Backup backup tools exist] "  
+    fi
+	if [ ! -z ${SIGN_IMAGE} ]; then
+		[ -f $PRIV_KEY_FILE ] && rm -rf $PRIV_KEY_FILE && echo "$PRIV_KEY_FILE"
+	    [ -f $CERT_FILE ] && rm -rf $CERT_FILE %% echo $CERT_FILE
+		echo "[Backup delete backup keys ]"
+	fi
+	sync
+	sync
+    if [ ! -z "${GRUB_WITH_INITRD}" ]; then
+        $UNSET_UEFI_BACKUP_ENV_COMMAND
+        $UNSET_UEFI_BACKUP_ENV_STATUS
+    else
+	    ${SET_BACKUP_ENV_COMMAND}
+	    ${SET_BACKUP_ENV_STATUS}
+    fi
+   
+    
+}
+
+function do_reboot {
+	do_clean
+	do_wait_key_event
+	/sbin/reboot -f
+}
+
+function backup_genkey {
+    [ ! -d $DEF_CERT_FILE_PATH ] && mkdir -p ${DEF_CERT_FILE_PATH}
+    [ -f ${DEF_CERT_FILE_PATH}/${DEF_X509_CONFIG} ] && { echo "old config exist" ; rm -rf ${DEF_CERT_FILE_PATH}/${DEF_X509_CONFIG}; }
+	cat >${DEF_CERT_FILE_PATH}/${DEF_X509_CONFIG} << EOF
+[ req ]
+default_bits = 4096
+distinguished_name = req_distinguished_name
+prompt = no
+x509_extensions = myexts
+string_mask = utf8only
+
+[ req_distinguished_name ]
+serialNumber = 05155853
+organizationalUnitName = IIoT Edge & Control SW
+countryName = TW
+stateOrProvinceName = Taipei City
+localityName = Neihu District
+organizationName = Advantech Co., Ltd
+commonName = swupdate backup key
+
+[ myexts ]
+basicConstraints=critical,CA:FALSE
+keyUsage=digitalSignature
+subjectKeyIdentifier=hash
+authorityKeyIdentifier=keyid
+extendedKeyUsage=emailProtection
+EOF
+}
+
+function create_new_keys_and_cert() {
+
+    [ ! -d ${DEF_CERT_FILE_PATH} ] &&  mkdir -p  "${DEF_CERT_FILE_PATH}"
+    [ -f  ${PRIV_KEY_FILE} ] && rm -rf ${PRIV_KEY_FILE}
+    [ -f  ${CERT_FILE} ] && rm -rf ${CERT_FILE}
+ 
+    #create x509_backup.genkey
+    backup_genkey
+    openssl req -new -utf8 -sha256 -days 36500 -batch -x509 -config "${DEF_CERT_FILE_PATH}/${DEF_X509_CONFIG}" -outform PEM -out  "${CERT_FILE}" -keyout "${PRIV_KEY_FILE}"  -passout pass:${PASSPHRASE}
+    rm -rf "${DEF_CERT_FILE_PATH}/${DEF_X509_CONFIG}"
+    update_cert  add       
+}
+
+function update_cert() {
+    
+    if [ "$1" = "remove" ]; then
+        
+        find "/etc/ssl/certs" -type l -exec bash -c '
+            for symlink; do
+            if [ "$(readlink -f "${symlink}")" = "$0" ]; then
+                rm "${ABS_EXT4_OUT_DIR}/${symlink}"                
+            fi
+            done
+        ' "${CERT_FILE}" {} +
+
+        #[ -f ${CERT_FILE} ] && rm -rf ${CERT_FILE}
+    
+    fi
+
+    if [ "$1" = "add" ]; then
+        if [ ! -f ${CERT_FILE} ]; then
+            echo_red "${CERT_FILE} not exist !!!!!"
+        fi
+    
+    fi
+    update-ca-certificates   
+}
+
+function import_exist_private_key() {
+    
+    [ ! -f "$1" ] && { echo_red "Error ,$1 not exist" ; exit 1 ; }
+    [ ! -d "${DEF_PRIV_FILE_PATH}" ] && mkdir -p "${DEF_PRIV_FILE_PATH}"
+    
+    if [ "$1" = "${PRIV_KEY_FILE}" ]; then
+        echo "the path is default key path , no change for private key  "
+    else
+        [ -f ${PRIV_KEY_FILE} ] && rm -rf ${PRIV_KEY_FILE}    
+        cp -rf "$1" "${PRIV_KEY_FILE}"   
+    fi
+}
+
+function import_exist_cert() {
+
+    [ ! -f "$1" ] && { echo_red "Error ,"$1" not exist" ; exit 1 ; }
+    [ ! -d ${DEF_CERT_FILE_PATH} ] &&  mkdir -p  "$DEF_CERT_FILE_PATH"
+    if [ "$1" = "${CERT_FILE}" ] ||  [ "$1" = "${CERT_LINK_FILE}" ]; then
+        echo "the path is default certificate path , no change for certificate  "
+    else
+        rm -rf ${CERT_FILE}
+        cp -rf "$1" "${CERT_FILE}"
+        update_cert add     
+    fi    
+}
+
+function import_aes_key() {
+    [ ! -f "$1" ] && { echo_red "Error ,"$1" not exist" ; exit 1 ; }
+    [ ! -d "${DEF_SIGN_FILE_PATH}" ] && mkdir -p "${DEF_SIGN_FILE_PATH}"
+    cp -rf "$1" "${DEF_SIGN_FILE_PATH}/${DEF_AESKEY}.sig"
+}
+
+
+function change_pw(){
+    
+    echo "verify current passphrase..."
+    verify_RSA_key
+
+    echo "change passphrase..."    
+    read -p "input new passphrase:" NEW_PWD
+    openssl rsa -in "$PRIV_KEY_FILE" -out $PRIV_KEY_FILE.tmp -passin pass:$PASSPHRASE
+    openssl rsa -in ${PRIV_KEY_FILE}.tmp -out $PRIV_KEY_FILE -aes256 -passout pass:$NEW_PWD    
+    [ $? == 0 ] && echo "change passphrase successfully" || {  echo "change passphrase failed" ; exit 1 ; }
+    PASSPHRASE=$NEW_PWD
+    backup_genkey
+    openssl req -new -utf8 -sha256 -days 3650 -batch -x509 -config "${DEF_CERT_FILE_PATH}/${DEF_X509_CONFIG}" -key ${PRIV_KEY_FILE} -out "${CERT_FILE}" -passin pass:${PASSPHRASE}
+    rm -rf ${DEF_CERT_FILE_PATH}/${DEF_X509_CONFIG}
+    rm -rf $PRIV_KEY_FILE.tmp
+
+    #check 
+    VERIFY_KEY=$(openssl rsa -modulus -noout -in $PRIV_KEY_FILE -passin pass:${PASSPHRASE} | openssl md5)
+    VERIFY_CRT=$(openssl x509 -modulus -noout -in ${CERT_FILE} | openssl md5)
+    if [ "${VERIFY_KEY}" != "${VERIFY_CRT}" ]; then
+        echo_red "update certificate failed!!!!!!!!! please re-create key and certificate again "
+        exit 1
+    else
+        update_cert add 
+        echo "update certificate done"
+    fi
+
+    
+    
+}
+
+function verify_RSA_key() {
+
+    # private key has be encrypted , check password then ask user for check password?
+    if openssl rsa -in "$PRIV_KEY_FILE" -check -passin pass:"$PASSPHRASE" -noout 2>/dev/null; then
+        echo "Verify RSA key is confirmed"
+    else
+        echo "wrong passphrase!! Could not read private key "
+        read -p  "input passphrase again:" PRIV_PWD
+            if openssl rsa -in "$PRIV_KEY_FILE" -check -noout -passin pass:${PRIV_PWD} 2>/dev/null; then
+                PASSPHRASE=$PRIV_PWD
+            else
+                echo "wrong passphrase !!!Could not read private key from $PRIV_KEY_FILE"
+                exit 1
+            fi
+   fi
+}
+
+function {
+
+		MOUNT_ABS_USB_PATH=`mount | grep ${ABS_USB}1 |  awk -F ' ' '{print $3}' | awk 'NR==1'`
+		if [ ! -z ${MOUNT_ABS_USB_PATH} ] ; then 
+			umount ${MOUNT_ABS_USB_PATH}  1>/dev/null 2>&1
+		fi
+
+		#start format usb 
+		USB_SIZE=$(lsblk ${ABS_USB} |  awk -F ' ' '{print $4}' |  awk 'NR==2' | tr -d 'M|G|T')
+        echo "USB_SIZE=$USB_SIZE"
+		if [ `echo "$USB_SIZE < 12 " | bc` -eq 1 ]; then
+        	echo "[Backup WARNING !! your USB path $ABS_USB size < 16G ,please try another one]. "
+			echo "[Backup WARNING !! your USB path $ABS_USB size < 16G ,please try another one]. " > $LOG_FILE
+			/usr/bin/atcc.sys-backup-msg FAILURE
+			do_reboot
+			exit 1
+        else
+			/usr/bin/atcc.sys-backup-msg FORMAT_USB
+			# destroy the partition table
+			dd if=/dev/zero of=${ABS_USB} bs=1M count=10 > /dev/null
+			echo ';' | sfdisk ${ABS_USB}             
+			RETURN_CODE=$?
+			if [ $RETURN_CODE -ne 0 ]; then
+				echo "Error! sfdisk ${ABS_USB} failed"	 
+				echo "[Backup WARNING !! format $ABS_USB fail]. " > $LOG_FILE
+				/usr/bin/atcc.sys-backup-msg FAILURE					
+				do_reboot				
+				exit 1
+			fi
+		echo "partition done"
+		if [ -x /usr/sbin/partprobe ]; then
+			/usr/sbin/partprobe ${ABS_USB} > /dev/null
+		else
+			sleep 1
+			echo "partprobe not found, ignore"
+		fi
+
+		# check partition exist and timout is 5 seconds
+		NEXT_WAIT_TIME=0
+		until [ $NEXT_WAIT_TIME -eq 5 ]; do
+			sleep 1
+			if [ -b ${ABS_USB}1 ] ; then
+				break
+			fi
+			$(( NEXT_WAIT_TIME++ ))
+		done
+		if [ $NEXT_WAIT_TIME -gt 5 ]; then
+			echo "Error! partition not exist"
+			exit 1
+		fi
+
+		##umount ${ABS_USB}1  1>/dev/null 2>&1
+		mkfs.ext4 -F -q  ${ABS_USB}1 1>/dev/null 2>&1
+		RETURN_CODE=$?
+		if [ $RETURN_CODE -ne 0 ]; then
+			echo "Error! mkfs.ext4  ${ABS_USB}1 failed"  
+                        /usr/bin/atcc.sys-backup-msg FAILURE
+                        do_reboot
+			exit 1
+		fi
+
+        e2fsck -p  ${ABS_USB}1      1>/dev/null 2>&1
+		RETURN_CODE=$?
+		if [ $RETURN_CODE -gt 4 ]; then
+			echo "Error! e2fsck ${ABS_USB}1  failed:$RETURN_CODE" 
+                        /usr/bin/atcc.sys-backup-msg FAILURE
+                        do_reboot
+			exit 1
+		fi		
+		sleep 1
+        fi
+        
+
+
+
+}
+
+usage_initrd() {
+    echo "Usage:  atcc.sys-backup [OPTIONS]"
+    echo "Options:"
+    echo "  -r         Path to the private key."
+    echo "  -c         Path to the CA certificate."
+    echo "  -d         Path to the USB device (e.g., /dev/sda)."
+    echo "  -p         Passphrase for encryption."
+    echo "  -s         Activate signing the image."
+    echo "  -h         Show this help message."
+}
+
+usage_user() {
+    echo "Usage: atcc.sys-backup [OPTIONS]"
+    echo "Options:"
+    echo "  -I, --import-crt=PATH       Path to the firmware update certificate."
+    echo "  -E, --import-aeskey=PATH    Path to the AES key(signed)."
+    echo "  -D, --deleteAll             Delete private key and certificate in device " 
+    echo "  -d, --device=PATH           Path to the USB device (e.g., /dev/sda)."
+    echo "  -p, --passin=PHRASE         Passphrase for operations."
+    echo "  -s, --sign                  Activate signing the image."
+    echo "  --reboot                    Reboot the system after operations."
+    echo "  -h, --help                  Show this help message."
+}
+
+#clear the environment in uefi to avoid not clearing it in the last operation
+if [ ! -z "${GRUB_WITH_INITRD}" ] && [ ! -z "${BOOT_FROM_EMMC}" ]; then 
+    [ ! -z "${BOOT_INITRD}" ] && $UNSET_UEFI_BACKUP_ENV_STATUS
+    BOOT_INITRD=`${PRINT_ENV} | grep $RECOVERY_STATUS  | awk -F '=' '{print $2}'`
+
+    [ ! -z "${BACKUP_CMD}" ] && $UNSET_UEFI_BACKUP_ENV_STATUS
+fi
+
+#backup file
+if [ ! -z "${BOOT_INITRD}" ] && [ "${BOOT_INITRD}" = "in_process" ] ; then       
+	BACKUP_BIN=`echo ${BACKUP_CMD} | grep "atcc.sys-backup" `
+    if [ ! -z "${BACKUP_BIN}" ] ; then        
+        while getopts ":r:c:d:k:p:d:h:s " opt; do
+            case $opt in                        
+                r)  
+                    PRIV_KEY_FILE="$OPTARG"
+                    ;;
+                c)
+                    CERT_FILE="$OPTARG"                   
+                    ;;
+                d) 
+                    ABS_USB="$OPTARG"
+                    if [ ! -b "$ABS_USB" ]; then
+                        echo "There is no USB device ($ABS_USB) present."
+                        echo "Backup system to SWU file failed!!"
+                        /usr/bin/atcc.sys-backup-msg FAILURE
+                        do_reboot
+                        exit 1
+                    fi                   
+                    ;;
+                p)
+                    PASSPHRASE="$OPTARG"                    
+                    ;;
+                s)
+                    SIGN_IMAGE="YES"                    
+                    ;;
+                h)
+                    usage_initrd
+                    exit 1
+                    ;;
+                b)
+                    BACKUP_PRIV_KEY="yes"            
+                    ;;
+                \?)
+                    echo "Invalid option: -$OPTARG" >&2
+                    INVALID_CMD="YES"
+                    ;;
+                :)
+                    echo "Option -$opt requires an argument." >&2
+                     MISS_ARG="YES"
+                    ;;
+            esac
+        done 
+
+        #Mount USB first if you need to write an error message before format
+        MOUNT_ABS_USB_PATH=`mount | grep ${ABS_USB}1 | awk -F ' ' '{print $3}' | awk 'NR==1'`
+        if [ -z ${MOUNT_ABS_USB_PATH} ] ; then
+            if [ ! -e ${ABS_DIR_USB} ]; then
+                 mkdir -p ${ABS_DIR_USB}
+            fi
+            mount ${ABS_USB}1 ${ABS_DIR_USB}
+        else
+            if [ "${MOUNT_ABS_USB_PATH}" != "${ABS_DIR_USB}" ]; then
+                umount ${MOUNT_ABS_USB_PATH}
+                mount ${ABS_USB}1 ${ABS_DIR_USB}
+            fi
+        fi
+	
+		if [ $# -lt 1 ] || [ ! -z ${INVALID_CMD} ] || [ ! -z ${MISS_ARG} ] ; then
+            echo "incorrect backup command :$0 $*"
+            usage_initrd
+            echo "[Backup ERROR !!incorrect backup command :$0 $*]" > $LOG_FILE
+            /usr/bin/atcc.sys-backup-msg FAILURE
+            do_reboot
+            exit 1
+        fi
+
+		if [ ! -z ${SIGN_IMAGE} ]; then 
+			if  [ ! -f $PRIV_KEY_FILE ] || [ ! -f $CERT_FILE ] || [ -z $PASSPHRASE ]; then
+				echo "please check follow files or wrong passphrase  : $PRIV_KEY_FILE , $CERT_FILE .wrong password : $PASSPHRASE]  !!! "             
+				echo "[Backup ERROR !!missng one of each file or wrong passphrase : $PRIV_KEY_FILE , $CERT_FILE .wrong password : $PASSPHRASE]" > $LOG_FILE            
+	            /usr/bin/atcc.sys-backup-msg FAILURE
+                do_reboot
+		        exit 1
+			fi            
+		fi
+
+		#test wheather atcc.sys-backup ui server is ready 
+       	while [ ! -f  "$BACKUP_INIT_DONE" ]
+		do
+			if [ $BACKUP_INIT_CNT -gt 10 ]; then
+				break;
+			fi
+			sleep 1 
+			/usr/bin/atcc.sys-backup-msg INIT		
+			BACKUP_INIT_CNT=$(($BACKUP_INIT_CNT+1))
+		done
+
+		/usr/bin/atcc.sys-backup-msg START
+		MOUNT_ABS_USB_PATH=`mount | grep ${ABS_USB}1 |  awk -F ' ' '{print $3}' | awk 'NR==1'`
+		if [ ! -z ${MOUNT_ABS_USB_PATH} ] ; then 
+			umount ${MOUNT_ABS_USB_PATH}  1>/dev/null 2>&1
+		fi
+
+		#start format usb 
+		USB_SIZE=$(lsblk ${ABS_USB} |  awk -F ' ' '{print $4}' |  awk 'NR==2' | tr -d 'M|G|T')
+        echo "USB_SIZE=$USB_SIZE"
+		if [ `echo "$USB_SIZE < 12 " | bc` -eq 1 ]; then
+        	echo "[Backup WARNING !! your USB path $ABS_USB size < 16G ,please try another one]. "
+			echo "[Backup WARNING !! your USB path $ABS_USB size < 16G ,please try another one]. " > $LOG_FILE
+			/usr/bin/atcc.sys-backup-msg FAILURE
+			do_reboot
+			exit 1
+        else
+			/usr/bin/atcc.sys-backup-msg FORMAT_USB
+			# destroy the partition table
+			dd if=/dev/zero of=${ABS_USB} bs=1M count=10 > /dev/null
+			echo ';' | sfdisk ${ABS_USB}             
+			RETURN_CODE=$?
+			if [ $RETURN_CODE -ne 0 ]; then
+				echo "Error! sfdisk ${ABS_USB} failed"	 
+				echo "[Backup WARNING !! format $ABS_USB fail]. " > $LOG_FILE
+				/usr/bin/atcc.sys-backup-msg FAILURE					
+				do_reboot				
+				exit 1
+			fi
+		echo "partition done"
+		if [ -x /usr/sbin/partprobe ]; then
+			/usr/sbin/partprobe ${ABS_USB} > /dev/null
+		else
+			sleep 1
+			echo "partprobe not found, ignore"
+		fi
+
+		# check partition exist and timout is 5 seconds
+		NEXT_WAIT_TIME=0
+		until [ $NEXT_WAIT_TIME -eq 5 ]; do
+			sleep 1
+			if [ -b ${ABS_USB}1 ] ; then
+				break
+			fi
+			$(( NEXT_WAIT_TIME++ ))
+		done
+		if [ $NEXT_WAIT_TIME -gt 5 ]; then
+			echo "Error! partition not exist"
+			exit 1
+		fi
+
+		##umount ${ABS_USB}1  1>/dev/null 2>&1
+		mkfs.ext4 -F -q  ${ABS_USB}1 1>/dev/null 2>&1
+		RETURN_CODE=$?
+		if [ $RETURN_CODE -ne 0 ]; then
+			echo "Error! mkfs.ext4  ${ABS_USB}1 failed"  
+                        /usr/bin/atcc.sys-backup-msg FAILURE
+                        do_reboot
+			exit 1
+		fi
+
+        e2fsck -p  ${ABS_USB}1      1>/dev/null 2>&1
+		RETURN_CODE=$?
+		if [ $RETURN_CODE -gt 4 ]; then
+			echo "Error! e2fsck ${ABS_USB}1  failed:$RETURN_CODE" 
+                        /usr/bin/atcc.sys-backup-msg FAILURE
+                        do_reboot
+			exit 1
+		fi		
+		sleep 1
+        fi
+        
+		[[  -e ${ABS_DIR_USB} ]] && rm -rf $ABS_DIR_USB  1>/dev/null 2>&1	
+		if  [ ! -e ${ABS_DIR_USB} ]; then 
+			mkdir -p $ABS_DIR_USB
+		fi
+		mount ${ABS_USB}1 $ABS_DIR_USB  1>/dev/null 2>&1				
+		sync
+		
+		if [ -d ${BACKUP_TOOLS} ]; then		
+			mv ${BACKUP_TOOLS} $ABS_DIR_USB		
+			cd $ABS_DIR_USB/${BACKUP_TOOLS_FILE}
+			#check emmc-rootfs
+			echo "[Backup Start Time : $(date '+%Y-%m-%d %H:%M:%S') ]"  > $LOG_FILE
+			echo "[Backup Rootfs Starting]"		  
+			/usr/bin/atcc.sys-backup-msg RUN
+
+			if [ -z ${EMMC_DIR_ROOTFS} ]; then
+			    mkdir  $EMMC_DIR_DEROOTFS
+			    EMMC_DIR_ROOTFS=${EMMC_DIR_DEROOTFS}   
+			    mount ${EMMC_NODE}p3 ${EMMC_DIR_ROOTFS} 1>/dev/null 2>&1
+        	    sync        		    
+			fi
+
+			if [ "`ls -A $EMMC_DIR_ROOTFS`" = "" ]; then			       
+			    umount ${EMMC_NODE}* 1>/dev/null 2>&1 
+			    mount ${EMMC_NODE}p3 $EMMC_DIR_ROOTFS  1>/dev/null 2>&1
+        	    sync
+        		
+        	    sleep 1		
+			fi
+
+			#making rootfs.ext4 		
+			./mk_rootfs_ext4.sh $EMMC_DIR_ROOTFS
+            RETURN_CODE=$?	
+            if [ $RETURN_CODE -ne 0 ]; then
+            	echo "Error! general rootfs.ext4 fail"   >> $LOG_FILE
+                /usr/bin/atcc.sys-backup-msg FAILURE
+				do_reboot 
+                exit 1
+            fi
+			sync
+			/usr/bin/atcc.sys-backup-msg IN_PROCESS
+			if [  -z ${SIGN_IMAGE} ]; then
+				./mkupdateimg.sh  -d rootfs.ext4
+			else
+                if [ "$BACKUP_PRIV_KEY" = "yes"] ;then
+                    ./mkupdateimg.sh  -d rootfs.ext4 -r $PRIV_KEY_FILE -c $CERT_FILE -p $PASSPHRASE -e $PRIV_KEY_FILE
+                else    
+    				./mkupdateimg.sh  -d rootfs.ext4 -r $PRIV_KEY_FILE -c $CERT_FILE -p $PASSPHRASE  
+                fi
+			fi
+            RETURN_CODE=$?
+            if [ $RETURN_CODE -ne 0 ]; then
+            	echo "Error! general recovery .swu file fail . End Time : $(date '+%Y-%m-%d %H:%M:%S') "    >> $LOG_FILE
+				echo "Error! general recovery .swu file fail . " 
+				/usr/bin/atcc.sys-backup-msg FAILURE
+				do_reboot
+                exit 1
+            fi
+			
+		fi
+		echo "[Backup Rootfs finished]"    
+		echo "[Backup End Time : $(date '+%Y-%m-%d %H:%M:%S') ]"  >> $LOG_FILE
+		/usr/bin/atcc.sys-backup-msg SUCCESS
+		sleep 2
+		/usr/bin/atcc.sys-backup-msg DONE 
+		
+	else 
+		echo "[Backup] without bootloader env "$RECOVERY_CMD" , recovery system FAIL!!!! "			
+		/usr/bin/atcc.sys-backup-msg FAILURE
+		do_reboot
+		exit 1
+	fi
+	do_clean
+	/sbin/reboot -f 
+else
+	if [ $# -lt 1 ] ; then
+    	usage_user
+        exit 1
+	fi
+    PRIV_KEY_FILE="${DEF_PRIV_FILE_PATH}/${DEF_PRIV_KEY}"
+    CERT_LINK_FILE="${CERT_LINK_PATH}/${DEF_CERT_LINK}"
+    CERT_FILE="${DEF_CERT_FILE_PATH}/${DEF_CERT}"
+
+    for arg in "$@"; do
+        case $arg in
+            -I=*|--import-crt=*)
+                IM_CERTIFICATE="${arg#*=}"
+                import_exist_cert ${IM_CERTIFICATE}                    
+                if [ -L ${CERT_LINK_FILE} ]; then
+                    echo "Import firmware update certificate successfully, the path is ${CERT_LINK_FILE}"
+                else
+                    echo "Import firmware update certificate failed"
+                    exit 1
+                fi
+                exit 1
+                ;;
+            -E=*|--import-aeskey=*)
+                IM_AES_KEY="${arg#*=}"
+                import_aes_key $IM_AES_KEY
+                [ -f "${DEF_SIGN_FILE_PATH}/${DEF_AESKEY}.sig" ] && echo "Import aes_key successfully, the path is ${DEF_SIGN_FILE_PATH}/${DEF_AESKEY}.sig" || echo "Import aes_key failed"
+                exit 1
+                ;;
+            -D|--deleteAll)                
+                update_cert remove
+                [ -f "${PRIV_KEY_FILE}" ] && rm -rf "${PRIV_KEY_FILE}"
+                [ -f "${DEF_CERT_FILE_PATH}" ] && rm -rf "${DEF_CERT_FILE_PATH}"
+                [ -f "${CERT_LINK_FILE}" ] && rm -rf "${CERT_LINK_FILE}"
+                [ -f "${DEF_SIGN_FILE_PATH}/${DEF_AESKEY}.sig" ] && rm -rf "${DEF_SIGN_FILE_PATH}/${DEF_AESKEY}.sig"    
+                echo "remove default keys in device done"
+                exit 1 
+                ;;
+            -d=*|--device=*)
+                ABS_USB="${arg#*=}"
+                [ -b "${ABS_USB}" ] && echo "${ABS_USB} exists" || { echo "Error: ${ABS_USB} does not exist"; exit 1; }
+                ;;
+            -p=*|--passin=*)
+                PASSPHRASE="${arg#*=}"
+                [ -z "${PASSPHRASE}" ] && { echo "Missing PASSPHRASE!!"; exit 1; }
+                ;;
+            -s|--sign)
+                SIGN_IMAGE="YES"
+                ;;
+            --reboot)
+                REBOOT="YES"
+                ;;
+            -h|--help)
+                usage_user
+                exit 1
+                ;;
+            *)
+                echo "Invalid option: $arg" >&2
+                usage_user
+                exit 1
+                ;;
+        esac
+    done
+    echo_yellow "Warning: You are about to perform a backup operation. Please ensure all important data is properly saved."
+	[ -z $SIGN_IMAGE ] && echo "create BACKUP file without signed images" || echo "create BACKUP file with signed images."
+
+	#emmc mode , set boot env
+	boot_device
+
+	MOUNT_ABS_USB_PATH=`mount | grep ${ABS_USB}1 | awk -F ' ' '{print $3}' | awk 'NR==1'`
+    if [ -z ${MOUNT_ABS_USB_PATH} ] ; then
+        if [ ! -e ${ABS_DIR_USB} ]; then
+            mkdir -p ${ABS_DIR_USB}
+        fi
+        mount ${ABS_USB}1 ${ABS_DIR_USB}
+        MOUNT_ABS_USB_PATH=${ABS_DIR_USB}
+	fi
+
+	if [[ -f "$MOUNT_ABS_USB_PATH/$INITRD_NAME" ]]; then
+  	  	  read -p "After detecting that this USB is for iso installation, select [Y] to not format, but only back up system files as rootfs.zstd and store them in this USB? 
+If you select [N], erase and format this USB, and then perform system backup(Y/N): " choice
+        case "$choice" in
+            [Yy]* ) 
+                echo "[Backup] Start backup current system to $ABS_USB/rootfs.zstd"
+                if [ -f  "$MOUNT_ABS_USB_PATH/atcc.sys-backup/atcc.sys-backup" ]; then
+                    if cat "$MOUNT_ABS_USB_PATH/atcc.sys-backup/atcc.sys-backup" | grep -q "clone system"; then
+                        rm -rf "$MOUNT_ABS_USB_PATH/atcc.sys-backup"
+                        echo "remove atcc.sys-backup with clone system command"
+                    fi
+                fi
+                [[ -f  "$MOUNT_ABS_USB_PATH/rootfs.zstd" ]] && rm -rf  "$MOUNT_ABS_USB_PATH/rootfs.zstd" && echo "remove old backup file : rootfs.zstd"               
+                [[ ! -d $MOUNT_ABS_USB_PATH/atcc.sys-backup ]] && mkdir $MOUNT_ABS_USB_PATH/atcc.sys-backup/
+
+                echo "clone system $(date '+%Y-%m-%d %H:%M:%S')" > $MOUNT_ABS_USB_PATH/atcc.sys-backup/atcc.sys-backup
+                SIGN_IMAGE=""    
+                echo "[Backup] reboot , please do not plug out USB device"
+                /sbin/reboot
+                exit 1 
+                ;;
+            * )                 
+                echo "perform system backup"
+                find_iso_image="y"
+                ;;
+        esac
+	fi
+    echo "[Backup] Start backup current system to $ABS_USB"
+    echo_red "[Backup] All data on $ABS_USB now will be destroyed! Continue? [y/n] "
+    read ans
+    if [ "$ans" != "y" ] && [ "$ans" != "Y" ] &&  [ "$ans" != "" ]; then
+        exit 1
+    fi
+
+	#add for secure 
+	if [ ! -z $SIGN_IMAGE ]; then 
+    	if [ ! -f ${PRIV_KEY_FILE} ] || [ ! -L ${CERT_LINK_FILE} ]; then
+			read -p "There is no private key or certificate on this device. Would you like to create one ?[Y/N]. 
+Choose [Y] to create a new key and certificate, 
+otherwise choose  [N] to import a specific private key and certificate:" create_default_key
+ 		    case "$create_default_key" in
+                [Yy]|"")
+					echo "=====> start create default keys......"
+                    [ -f "${DEF_SIGN_FILE_PATH}/${DEF_AESKEY}.sig" ] && rm -rf "${DEF_SIGN_FILE_PATH}/${DEF_AESKEY}.sig"
+                	create_new_keys_and_cert
+                    if [ ! -L "${CERT_LINK_FILE}" ] || [ ! -f "${PRIV_KEY_FILE}" ]; then
+                    	echo_red "=====> "$"${CERT_LINK_FILE} and ""${PRIV_KEY_FILE} failed created"
+                        exit 1
+                    else
+                        echo_yellow "=====> "${CERT_LINK_FILE}" and "${PRIV_KEY_FILE}" successfully created"
+						NEW_KEY="YES"
+					fi                  
+					;;
+
+				[Nn]* )
+                    
+                    [ -f "${DEF_SIGN_FILE_PATH}/${DEF_AESKEY}.sig" ] && rm -rf "${DEF_SIGN_FILE_PATH}/${DEF_AESKEY}.sig"
+                    echo "Please enter the private key path : "
+					read CUSTOMER_PRIV_KEY
+                    import_exist_private_key ${CUSTOMER_PRIV_KEY}
+
+                    echo "Please enter the certificate path : "
+                    read CUSTOMER_CERTIFICATE
+                    import_exist_cert  ${CUSTOMER_CERTIFICATE}
+					NEW_KEY="YES"
+					echo "File saved successfully"
+                    ;;
+                * )
+                    echo "invalid choice"
+                    echo "stop backup"
+                    exit 1
+                ;;
+                esac
+		fi
+		if [ -z ${NEW_KEY} ] && [  -f ${PRIV_KEY_FILE} ] && [ -L ${CERT_LINK_FILE} ]; then
+               # read -p "The private key and certificate used for backup already exists at: ${DEF_SIGN_FILE_PATH} . Do you want to replace it [Y/N]? If you select [Y], you need to enter the path of the new files to update the backup private key and certificate:" update_priv_crt
+                read -p "The private key and certificate used for backup already exists in device . Do you want to replace it [Y/N]?" update_priv_crt
+		        case "$update_priv_crt" in
+               	    [Yy]| "" )
+                        [ -f "${DEF_SIGN_FILE_PATH}/${DEF_AESKEY}.sig" ] && rm -rf "${DEF_SIGN_FILE_PATH}/${DEF_AESKEY}.sig"
+                        # Show options for key pair modifications
+                        echo "Followed by:"
+                        echo "Select an option:"
+                        echo "1) Enter the path of the backup private key and certificate to update them."
+                        echo "2) Change the password for the backup private key."
+                        echo "3) Generate a new certificate and a backup private key with password."    
+                        read -p "Please enter your choice (1/2/3): " choice
+                        case $choice in
+                            1)
+                                # Option 1: Ask for the existing key path
+                                echo "Please enter the PRIVATE KEY path : "
+                                read CUSTOMER_PRIV_KEY
+                                import_exist_private_key ${CUSTOMER_PRIV_KEY}
+
+                                echo "Please enter the certificate path : "
+                                read CUSTOMER_CERTIFICATE
+                                import_exist_cert  ${CUSTOMER_CERTIFICATE}
+
+                                if [  -f ${PRIV_KEY_FILE} ] && [ -L ${CERT_LINK_FILE} ]; then
+                                    echo "key and certificate updated successfully"
+                                else
+                                    echo "Error: The specified key path does not exist."
+                                fi
+                                ;;   
+                            
+                            2) 
+                                # Option 2: change password
+                                change_pw
+                                ;;                                
+                            3)
+                                #Option 3: Generate a new key pair
+                                echo "=====> create keys...."
+                                create_new_keys_and_cert                                
+                                if [ ! -L "${CERT_LINK_FILE}" ] || [ ! -f "${PRIV_KEY_FILE}" ]; then
+                                    echo_red "=====> "${PRIV_KEY_FILE}" and "$CERT_LINK_FILE" failed created"
+                                    exit 1
+                                else
+                                    echo_yellow "=====> "${PRIV_KEY_FILE}" and "$CERT_LINK_FILE" successfully updated "                                    
+                                fi
+                                ;;                                            
+                              *)
+                                 echo "invalid choice"
+                                 exit 1
+                                ;;  
+                           esac
+                            ;;
+			        [Nn]* )
+		                echo "use default key from ${PRIV_KEY_FILE}"
+                        verify_RSA_key
+						;;
+        	        * )
+                	    echo "invalid choice"
+                        echo "use default key from ${PRIV_KEY_FILE} "
+                		;;
+                esac				
+		fi  #if key exist 
+		
+		#check private key is encrypted or not          
+        first_line=$(head -n 1 "${PRIV_KEY_FILE}")
+        if [[ "$first_line" != *"ENCRYPTED PRIVATE KEY"* ]]; then
+                echo_red "Error , ${PRIV_KEY_PATH} format error , it is not "ENCRYPTED PRIVATE KEY"" 
+				echo "Please update the private key on  device "
+				exit 1
+				#openssl rsa -in "$PRIV_KEY_PATH" -out "$PRIV_KEY_PATH" -aes256 -passout pass:"$PASSPHRASE"
+		fi  
+
+        # Inform the user about the backup operation
+        echo_yellow "Please note that the backup file will NOT contain the private key or any authentication-related data by default."
+
+        # Prompt the user about backing up private keys separately
+        read -p "Would you like to separately back up the private key to the USB drive? This private key is for backup purposes only. (y/n): " backup_key
+
+        MOUNT_USERDATA_PATH=`mount | grep ${EMMC_NODE}p4 | awk -F ' ' '{print $3}' | awk 'NR==1'`
+        if [ -z ${MOUNT_USERDATA_PATH} ] ; then             
+        	mount ${EMMC_NODE}p4 "/userdata"
+			MOUNT_USERDATA_PATH="/userdata"
+        fi
+
+        [ -f ${MOUNT_USERDATA_PATH}/${DEF_PRIV_KEY} ] && rm -rf ${MOUNT_USERDATA_PATH}/${DEF_PRIV_KEY}
+		cp -rf ${PRIV_KEY_FILE} ${MOUNT_USERDATA_PATH}/${DEF_PRIV_KEY}
+        [ -f ${MOUNT_USERDATA_PATH}/${DEF_CERT} ] && rm -rf ${MOUNT_USERDATA_PATH}/${DEF_CERT}
+		cp -rfL ${CERT_LINK_FILE} ${MOUNT_USERDATA_PATH}/${DEF_CERT}
+	fi
+	
+	${SET_BACKUP_ENV_STATUS}${BACKUP_STATUS_IN_PROCESS}
+
+	if [ ! -z $SIGN_IMAGE ]; then
+        if [[ "$backup_key" == "y" || "$backup_key" == "Y" ]]; then
+            BACKUP_CMD_EXEC="atcc.sys-backup -s -d "${ABS_USB}" -r "${MOUNT_USERDATA_PATH}/${DEF_PRIV_KEY}"  -c "${MOUNT_USERDATA_PATH}/${DEF_CERT}" -p "${PASSPHRASE}" -b "${MOUNT_USERDATA_PATH}/${DEF_PRIV_KEY}"" 
+        else
+            BACKUP_CMD_EXEC="atcc.sys-backup -s -d "${ABS_USB}" -r "${MOUNT_USERDATA_PATH}/${DEF_PRIV_KEY}"  -c "${MOUNT_USERDATA_PATH}/${DEF_CERT}" -p "${PASSPHRASE}"" 
+        fi
+	else
+        BACKUP_CMD_EXEC="atcc.sys-backup -d "${ABS_USB}"" 
+	fi
+    ${SET_BACKUP_ENV_COMMAND}"${BACKUP_CMD_EXEC}"
+    #    echo "${SET_BACKUP_ENV_COMMAND}${BACKUP_CMD_EXEC}"     
+
+    #need format usb before reboot , otherwise  iso installation will be perform instead of backup
+    if [ ! -z ${find_iso_image} ] ;then
+         
+    fi
+	if [ ! -z "$REBOOT" ]; then 
+        if [ ! -z ${GRUB_WITH_INITRD} ];then
+		    ENTRY_BACKUP="backup"
+            echo "reboot to grub-reboot ${ENTRY_BACKUP}"
+            grub-reboot --boot-directory=${MOUNT_POINT} ${ENTRY_BACKUP}
+        fi
+		echo "[Backup] reboot"
+		/sbin/reboot 
+	fi
+fi
